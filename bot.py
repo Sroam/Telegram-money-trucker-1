@@ -135,25 +135,27 @@ def row_to_exp(row) -> Expense:
         created_at=datetime.fromisoformat(row["created_at"]))
 
 # ── Parser (Claude AI) ────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an expense parsing assistant. Extract structured expense data from natural, messy, multilingual text.
+SYSTEM_PROMPT = """You are an expense parsing assistant. Extract ALL expenses from natural, messy, multilingual text.
 
-INPUT can be English, Greek, German, Greeklish, or any mix. Voice-to-text errors are common.
+INPUT can be English, Greek, German, Greeklish, Dutch, or any mix. Voice-to-text errors are common.
+The input may contain ONE or MULTIPLE expenses mentioned together.
 
-OUTPUT: Return ONLY valid JSON. No explanation, no markdown.
+OUTPUT: Return ONLY a valid JSON array. No explanation, no markdown, no extra text.
+Always return an ARRAY even for a single expense: [{"amount":...}, ...]
 
-JSON schema:
-{"amount": <number or null>, "currency": "EUR", "category": <string>, "merchant": <string or null>, "description": <string>, "date_offset": <0=today, -1=yesterday>, "confidence": <float 0-1>}
+Each item schema:
+{"amount": <number>, "currency": "EUR", "category": <string>, "merchant": <string or null>, "description": <string>, "date_offset": <0=today, -1=yesterday>, "confidence": <float 0-1>}
 
 CATEGORIES (use exactly): food, coffee, supermarket, gas, cigarettes, shopping, entertainment, transport, bills, health, home, clothes, other
 
 RULES:
 - coffee/kaffee/kafe/καφές/espresso/latte/cappuccino/frappe → "coffee"
-- food/essen/φαγητό/restaurant/pizza/souvlaki/burger/delivery/wolt → "food"
-- supermarket/einkaufen/ψώνια/psonia → "supermarket"
+- food/essen/φαγητό/φαΐ/restaurant/pizza/souvlaki/gyros/γύρος/burger/delivery/wolt/voedsel → "food"
+- supermarket/einkaufen/ψώνια/psonia/boodschappen → "supermarket"
 - lidl/aldi/rewe/penny/edeka/netto/spar/billa/σκλαβενίτης/ab → "supermarket"
-- gas/tanken/βενζίνη/venzini/petrol/fuel → "gas"
+- gas/tanken/βενζίνη/venzini/petrol/fuel/benzine/benzina → "gas"
 - shell/bp/aral/esso/total/revoil → "gas"
-- cigarettes/zigaretten/τσιγάρα/tsigara/marlboro/winston → "cigarettes"
+- cigarettes/zigaretten/τσιγάρα/tsigara/marlboro/winston/sigaretten → "cigarettes"
 - transport/bus/taxi/metro/uber/ubahn → "transport"
 - bills/rechnung/ΔΕΗ/ΟΤΕ/internet/electricity → "bills"
 - health/apotheke/pharmacy/φαρμακείο → "health"
@@ -161,50 +163,77 @@ RULES:
 - clothes/zara/h&m/primark/ρούχα → "clothes"
 - entertainment/kino/cinema/netflix/spotify/bar → "entertainment"
 
-AMOUNTS: 10/10.50/10,50/€10/10€/10 euro/zehn/δέκα/ten → number
+AMOUNTS: 10/10.50/10,50/€10/10€/10 euro/zehn/δέκα/tien/twintig/twin → number
+Word numbers: tien=10, twintig=20, dertig=30, veertig=40, vijftig=50 (Dutch)
+              zehn=10, zwanzig=20, dreißig=30 (German)
+              δέκα=10, είκοσι=20, τριάντα=30, σαράντα=40, πενήντα=50 (Greek)
 DATES: today/heute/σήμερα=0, yesterday/gestern/χτες=-1
 
-EXAMPLES:
-"lidl 30" → {"amount":30,"currency":"EUR","category":"supermarket","merchant":"Lidl","description":"Lidl supermarket","date_offset":0,"confidence":0.95}
-"kafe 3" → {"amount":3,"currency":"EUR","category":"coffee","merchant":null,"description":"coffee","date_offset":0,"confidence":0.9}
-"βενζίνη 50" → {"amount":50,"currency":"EUR","category":"gas","merchant":null,"description":"fuel","date_offset":0,"confidence":0.95}
-"gestern 35 rewe" → {"amount":35,"currency":"EUR","category":"supermarket","merchant":"Rewe","description":"Rewe supermarket","date_offset":-1,"confidence":0.95}
-"shell 60" → {"amount":60,"currency":"EUR","category":"gas","merchant":"Shell","description":"Shell fuel","date_offset":0,"confidence":0.95}
-"venzin 40" → {"amount":40,"currency":"EUR","category":"gas","merchant":null,"description":"fuel","date_offset":0,"confidence":0.9}
-"psonia 25" → {"amount":25,"currency":"EUR","category":"supermarket","merchant":null,"description":"shopping","date_offset":0,"confidence":0.85}"""
+MULTIPLE EXPENSE EXAMPLES:
+"20€ βενζίνη, 15€ τσιγάρα και 10€ γύρος" → [
+  {"amount":20,"currency":"EUR","category":"gas","merchant":null,"description":"fuel","date_offset":0,"confidence":0.95},
+  {"amount":15,"currency":"EUR","category":"cigarettes","merchant":null,"description":"cigarettes","date_offset":0,"confidence":0.95},
+  {"amount":10,"currency":"EUR","category":"food","merchant":null,"description":"gyros","date_offset":0,"confidence":0.95}
+]
+"twintig euro benzine, tien euro sigaretten en twintig euro voedsel" → [
+  {"amount":20,"currency":"EUR","category":"gas","merchant":null,"description":"fuel","date_offset":0,"confidence":0.9},
+  {"amount":10,"currency":"EUR","category":"cigarettes","merchant":null,"description":"cigarettes","date_offset":0,"confidence":0.9},
+  {"amount":20,"currency":"EUR","category":"food","merchant":null,"description":"food","date_offset":0,"confidence":0.9}
+]
+"lidl 30" → [{"amount":30,"currency":"EUR","category":"supermarket","merchant":"Lidl","description":"Lidl supermarket","date_offset":0,"confidence":0.95}]
+"βενζίνη 50" → [{"amount":50,"currency":"EUR","category":"gas","merchant":null,"description":"fuel","date_offset":0,"confidence":0.95}]
 
-def parse_expense(text: str, today: date = None) -> Optional[dict]:
+If no valid expense found, return empty array: []"""
+
+MERCHANT_MAP = {"lidl":"Lidl","aldi":"Aldi","rewe":"Rewe","penny":"Penny","edeka":"Edeka",
+    "netto":"Netto","spar":"Spar","billa":"Billa","shell":"Shell","bp":"BP","aral":"Aral",
+    "esso":"Esso","total":"Total","revoil":"Revoil","starbucks":"Starbucks","costa":"Costa",
+    "zara":"Zara","ikea":"IKEA","obi":"OBI","h&m":"H&M","primark":"Primark"}
+
+def parse_expenses(text: str, today: date = None) -> List[dict]:
+    """Parse text and return a LIST of expenses (supports multiple in one message)."""
     if today is None: today = date.today()
     text = text.strip()
-    if not text: return None
+    if not text: return []
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model=PARSE_MODEL, max_tokens=300, system=SYSTEM_PROMPT,
+        msg = client.messages.create(model=PARSE_MODEL, max_tokens=800, system=SYSTEM_PROMPT,
             messages=[{"role":"user","content":text}])
         raw = msg.content[0].text.strip()
         raw = re.sub(r"^```(?:json)?\s*","",raw); raw = re.sub(r"\s*```$","",raw)
         try: data = json.loads(raw)
         except:
-            m = re.search(r"\{.*\}",raw,re.DOTALL)
-            data = json.loads(m.group()) if m else None
-        if not data or data.get("amount") is None: return None
-        amount = float(data["amount"])
-        if amount <= 0: return None
-        offset = int(data.get("date_offset",0))
-        merchant = data.get("merchant")
-        if merchant:
-            special = {"lidl":"Lidl","aldi":"Aldi","rewe":"Rewe","penny":"Penny","edeka":"Edeka",
-                "netto":"Netto","spar":"Spar","shell":"Shell","bp":"BP","aral":"Aral","esso":"Esso",
-                "total":"Total","starbucks":"Starbucks","zara":"Zara","ikea":"IKEA","obi":"OBI"}
-            merchant = special.get(merchant.lower(), merchant.title())
-        return {"amount":round(amount,2),"currency":data.get("currency","EUR"),
-            "category":data.get("category","other"),"merchant":merchant,
-            "description":data.get("description",text)[:100],
-            "date":today+timedelta(days=offset),"confidence":float(data.get("confidence",0.5))}
+            m = re.search(r"\[.*\]",raw,re.DOTALL)
+            data = json.loads(m.group()) if m else []
+        if not isinstance(data, list): data = [data] if isinstance(data, dict) else []
+        results = []
+        for item in data:
+            if not item or item.get("amount") is None: continue
+            amount = float(item["amount"])
+            if amount <= 0: continue
+            offset = int(item.get("date_offset", 0))
+            merchant = item.get("merchant")
+            if merchant:
+                merchant = MERCHANT_MAP.get(merchant.lower(), merchant.title())
+            results.append({
+                "amount": round(amount, 2),
+                "currency": item.get("currency", "EUR"),
+                "category": item.get("category", "other"),
+                "merchant": merchant,
+                "description": item.get("description", text)[:100],
+                "date": today + timedelta(days=offset),
+                "confidence": float(item.get("confidence", 0.5))
+            })
+        return results
     except Exception as e:
         logger.error(f"Parse error: {e}")
-        return None
+        return []
+
+# Keep single parse for backward compat
+def parse_expense(text: str, today: date = None) -> Optional[dict]:
+    results = parse_expenses(text, today)
+    return results[0] if results else None
 
 # ── Voice transcription ───────────────────────────────────────────────────────
 def transcribe_voice(audio_bytes: bytes) -> Optional[str]:
@@ -438,25 +467,46 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await process(update, u.id, text)
 
 async def process(update, uid, text):
-    result = parse_expense(text)
-    if not result:
+    results = parse_expenses(text)
+    if not results:
         await update.message.reply_text(
             f"🤔 Δεν κατάλαβα: _{text}_\n\nΔοκίμασε:\n• `10 euro coffee`\n• `βενζίνη 50`\n• `lidl 30`",
             parse_mode=ParseMode.MARKDOWN); return
-    exp = Expense(id=None, user_id=uid, amount=result["amount"], currency=result["currency"],
-        category=result["category"], merchant=result["merchant"], description=result["description"],
-        raw_input=text, date=result["date"], created_at=datetime.now())
-    exp.id = db_add(exp)
-    date_label = "Σήμερα" if exp.date == date.today() else exp.date.strftime("%d %b %Y")
-    cat_label = CATEGORY_LABELS.get(exp.category, exp.category.title())
-    lines = [f"✅ *Καταγράφηκε!*\n",
-             f"💶 *Ποσό:* €{exp.amount:.2f}",
-             f"{exp.emoji} *Κατηγορία:* {cat_label}"]
-    if exp.merchant: lines.append(f"🏪 *Κατάστημα:* {exp.merchant}")
-    lines.append(f"📅 *Ημερομηνία:* {date_label}")
-    lines.append(f"📝 *Σημείωση:* {exp.description}")
-    lines.append(f"\n_Στείλε άλλο έξοδο ή χρησιμοποίησε /today_")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    # Save all expenses
+    saved = []
+    for result in results:
+        exp = Expense(id=None, user_id=uid, amount=result["amount"], currency=result["currency"],
+            category=result["category"], merchant=result["merchant"], description=result["description"],
+            raw_input=text, date=result["date"], created_at=datetime.now())
+        exp.id = db_add(exp)
+        saved.append(exp)
+
+    # Single expense — detailed reply
+    if len(saved) == 1:
+        exp = saved[0]
+        date_label = "Σήμερα" if exp.date == date.today() else exp.date.strftime("%d %b %Y")
+        cat_label = CATEGORY_LABELS.get(exp.category, exp.category.title())
+        lines = [f"✅ *Καταγράφηκε!*\n",
+                 f"💶 *Ποσό:* €{exp.amount:.2f}",
+                 f"{exp.emoji} *Κατηγορία:* {cat_label}"]
+        if exp.merchant: lines.append(f"🏪 *Κατάστημα:* {exp.merchant}")
+        lines.append(f"📅 *Ημερομηνία:* {date_label}")
+        lines.append(f"📝 *Σημείωση:* {exp.description}")
+        lines.append(f"\n_Στείλε άλλο έξοδο ή χρησιμοποίησε /today_")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    # Multiple expenses — summary reply
+    else:
+        total = sum(e.amount for e in saved)
+        lines = [f"✅ *{len(saved)} έξοδα καταγράφηκαν!*\n"]
+        for exp in saved:
+            cat_label = CATEGORY_LABELS.get(exp.category, exp.category.title())
+            merchant_str = f" @ {exp.merchant}" if exp.merchant else ""
+            lines.append(f"{exp.emoji} €{exp.amount:.2f} — {cat_label}{merchant_str}")
+        lines.append(f"\n💶 *Σύνολο: €{total:.2f}*")
+        lines.append(f"\n_Χρησιμοποίησε /today για να δεις όλα τα σημερινά_")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
