@@ -319,11 +319,10 @@ def to_csv(expenses):
 # ── Messages ──────────────────────────────────────────────────────────────────
 HELP = """🤖 *Expense Tracker Bot*
 
-*Πρόσθεσε έξοδο* — στείλε μήνυμα ή 🎤 φωνητικό:
-  • `10 euro coffee`
-  • `βενζίνη 50`
-  • `lidl 30`
-  • `gestern 15 essen`
+*Πρόσθεσε έξοδο:*
+  ✉️ Γράψε: `βενζίνη 50` ή `lidl 30`
+  🎤 Στείλε φωνητικό μήνυμα
+  📷 Στείλε φωτογραφία απόδειξης ή screenshot
 
 *Προβολή εξόδων:*
   /today — Σήμερα
@@ -345,11 +344,10 @@ HELP = """🤖 *Expense Tracker Bot*
 
 START = """👋 *Καλώς ήρθες στο Expense Tracker!*
 
-Στείλε μου ένα μήνυμα ή 🎤 φωνητικό:
-  • `10 euro coffee`
-  • `βενζίνη 50`
-  • `lidl 30`
-  • `gestern tanken 45`
+Στείλε μου:
+  ✉️ Μήνυμα: `βενζίνη 50` ή `lidl 30`
+  🎤 Φωνητικό μήνυμα
+  📷 Φωτογραφία απόδειξης ή screenshot τράπεζας
 
 /help για όλες τις εντολές."""
 
@@ -451,6 +449,83 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_upsert_user(u.id, u.username or "", u.first_name or "")
     await process(update, u.id, update.message.text.strip())
 
+# ── Image parsing (Claude Vision) ────────────────────────────────────────────
+IMAGE_SYSTEM_PROMPT = """You are an expense parsing assistant. You receive an image — a receipt, invoice, bank screenshot, or any photo with expense info.
+
+Extract ALL expenses visible in the image.
+
+OUTPUT: Return ONLY a valid JSON array. No explanation, no markdown.
+Always return an ARRAY: [{"amount":...}, ...]
+
+Each item schema:
+{"amount": <number>, "currency": "EUR", "category": <string>, "merchant": <string or null>, "description": <string>, "confidence": <float 0-1>}
+
+CATEGORIES (use exactly): food, coffee, supermarket, gas, cigarettes, shopping, entertainment, transport, bills, health, home, clothes, other
+
+INSTRUCTIONS:
+- Supermarket receipt: extract the TOTAL (look for "Summe", "Total", "Σύνολο", "Gesamt", "Totaal", "TOTAL") as ONE expense
+- Bank statement: extract each transaction separately
+- Single receipt/invoice: one expense
+- Detect merchant from logo or header text
+- Lidl/Rewe/Aldi/Penny/Edeka/Netto → supermarket
+- Shell/BP/Aral/Esso/Total → gas
+- If image is unclear or has no expense info → return []"""
+
+async def parse_image_expenses(image_bytes: bytes) -> List[dict]:
+    try:
+        import anthropic, base64
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            system=IMAGE_SYSTEM_PROMPT,
+            messages=[{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":b64}},
+                {"type":"text","text":"Extract all expenses from this image. Return JSON array only."}
+            ]}]
+        )
+        raw = msg.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?\s*","",raw); raw = re.sub(r"\s*```$","",raw)
+        try: data = json.loads(raw)
+        except:
+            m = re.search(r"\[.*\]",raw,re.DOTALL)
+            data = json.loads(m.group()) if m else []
+        if not isinstance(data, list): data = [data] if isinstance(data, dict) else []
+        results = []
+        for item in data:
+            if not item or item.get("amount") is None: continue
+            amount = float(item["amount"])
+            if amount <= 0: continue
+            merchant = item.get("merchant")
+            if merchant: merchant = MERCHANT_MAP.get(merchant.lower(), merchant.title())
+            results.append({"amount":round(amount,2),"currency":item.get("currency","EUR"),
+                "category":item.get("category","other"),"merchant":merchant,
+                "description":item.get("description","receipt")[:100],
+                "date":date.today(),"confidence":float(item.get("confidence",0.7))})
+        return results
+    except Exception as e:
+        logger.error(f"Image parse error: {e}"); return []
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not allowed(u.id): return
+    db_upsert_user(u.id, u.username or "", u.first_name or "")
+    msg = await update.message.reply_text("📷 Αναλύω την εικόνα... ⏳")
+    try:
+        photo = update.message.photo[-1]  # highest resolution
+        file = await ctx.bot.get_file(photo.file_id)
+        img_bytes = await file.download_as_bytearray()
+    except Exception as e:
+        await msg.edit_text("❌ Σφάλμα κατεβάσματος εικόνας."); return
+    results = await parse_image_expenses(bytes(img_bytes))
+    if not results:
+        await msg.edit_text(
+            "🤔 Δεν βρήκα έξοδα στην εικόνα.\n\n"
+            "Δοκίμασε με:\n• 🧾 Απόδειξη supermarket\n• 📱 Screenshot τράπεζας\n• 🏷️ Τιμολόγιο"); return
+    await msg.delete()
+    await process_results(update, u.id, results, source="📷")
+
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not allowed(u.id): return
@@ -472,17 +547,18 @@ async def process(update, uid, text):
         await update.message.reply_text(
             f"🤔 Δεν κατάλαβα: _{text}_\n\nΔοκίμασε:\n• `10 euro coffee`\n• `βενζίνη 50`\n• `lidl 30`",
             parse_mode=ParseMode.MARKDOWN); return
+    await process_results(update, uid, results, source="✉️")
 
-    # Save all expenses
+async def process_results(update, uid, results: List[dict], source: str = ""):
     saved = []
+    raw = f"[{source}]"
     for result in results:
         exp = Expense(id=None, user_id=uid, amount=result["amount"], currency=result["currency"],
             category=result["category"], merchant=result["merchant"], description=result["description"],
-            raw_input=text, date=result["date"], created_at=datetime.now())
+            raw_input=raw, date=result["date"], created_at=datetime.now())
         exp.id = db_add(exp)
         saved.append(exp)
 
-    # Single expense — detailed reply
     if len(saved) == 1:
         exp = saved[0]
         date_label = "Σήμερα" if exp.date == date.today() else exp.date.strftime("%d %b %Y")
@@ -495,8 +571,6 @@ async def process(update, uid, text):
         lines.append(f"📝 *Σημείωση:* {exp.description}")
         lines.append(f"\n_Στείλε άλλο έξοδο ή χρησιμοποίησε /today_")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-    # Multiple expenses — summary reply
     else:
         total = sum(e.amount for e in saved)
         lines = [f"✅ *{len(saved)} έξοδα καταγράφηκαν!*\n"]
@@ -505,7 +579,7 @@ async def process(update, uid, text):
             merchant_str = f" @ {exp.merchant}" if exp.merchant else ""
             lines.append(f"{exp.emoji} €{exp.amount:.2f} — {cat_label}{merchant_str}")
         lines.append(f"\n💶 *Σύνολο: €{total:.2f}*")
-        lines.append(f"\n_Χρησιμοποίησε /today για να δεις όλα τα σημερινά_")
+        lines.append(f"\n_Χρησιμοποίησε /today για να δεις όλα_")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -526,6 +600,7 @@ def main():
     app.add_handler(CommandHandler("delete_last", cmd_undo))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
